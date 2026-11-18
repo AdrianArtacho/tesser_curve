@@ -1,5 +1,7 @@
 # tesser_curve
 
+![img/gui.ong](img/gui.png)
+
 A Max for Live MIDI effect for the original incoming-CC curve mapping and timed ramps triggered by **Session View clip names on the device's own track**. Each instance has its own remembered value and ramp state.
 
 ## Quick start

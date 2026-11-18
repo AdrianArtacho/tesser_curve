@@ -1,0 +1,84 @@
+/* Event-driven Session View observer. No metro, beat-position polling or per-loop work. */
+autowatch = 1;
+inlets = 1;
+outlets = 2; // engine commands; diagnostics
+var track = null, song = null, clip = null, statusObserver = null, startObserver = null;
+var initialized = false, isEnabled = true, pending = false, binding = false;
+var lastId = 0, lastStart = null, wasPlaying = false;
+var reconcileTask = new Task(reconcile, this);
+function diagnostic(s) { outlet(1, "set", s); }
+function detach(api) { if (api) { api.property = ""; api.id = 0; } }
+function clearClip() {
+    detach(statusObserver); detach(startObserver); detach(clip);
+    statusObserver = null; startObserver = null; clip = null;
+}
+function release() {
+    reconcileTask.cancel(); pending = false;
+    binding = true; clearClip(); detach(track); detach(song); binding = false;
+    track = null; song = null; lastId = 0; lastStart = null; wasPlaying = false;
+}
+function changed(args) {
+    if (binding || !isEnabled || !args || args[0] === "id") { return; }
+    if (!pending) { pending = true; reconcileTask.schedule(0); }
+}
+function scalar(api, prop) {
+    var result = api.get(prop);
+    return Number(result instanceof Array ? result[result.length - 1] : result);
+}
+function init() {
+    initialized = true; release();
+    if (!isEnabled) { return; }
+    try {
+        binding = true;
+        track = new LiveAPI(changed, "this_device");
+        var depth = 0;
+        while (track.id && track.type !== "Track" && depth++ < 32) { track.goto("canonical_parent"); }
+        if (!track.id || track.type !== "Track") { throw new Error("Place this MIDI device on a Session track"); }
+        track.mode = 0; track.property = "playing_slot_index";
+        song = new LiveAPI(changed, "live_set"); song.property = "is_playing";
+        binding = false; changed(["init"]);
+    } catch (e) { binding = false; release(); diagnostic("Session observer: " + e.message); }
+}
+function enabled(v) {
+    isEnabled = Number(v) !== 0;
+    if (!isEnabled) { release(); outlet(0, "stop"); }
+    else if (initialized && !track) { init(); }
+}
+function reconcile() {
+    pending = false;
+    if (!isEnabled || !track || !track.id || !song || !song.id) { return; }
+    try {
+        var slot = scalar(track, "playing_slot_index"), playing = scalar(song, "is_playing") !== 0;
+        if (slot < 0 || !playing) {
+            if (wasPlaying) { outlet(0, "stop"); }
+            wasPlaying = false; lastStart = null;
+            if (slot < 0) { binding = true; clearClip(); binding = false; lastId = 0; }
+            return;
+        }
+        // Track object follows its ID; reordering tracks does not retarget the device.
+        var path = track.unquotedpath + " clip_slots " + slot + " clip";
+        if (!clip || !clip.id || clip.unquotedpath !== path) {
+            binding = true; clearClip(); clip = new LiveAPI(null, path);
+            if (!clip.id) { binding = false; if (wasPlaying) { outlet(0, "stop"); } wasPlaying = false; lastId = 0; return; }
+            statusObserver = new LiveAPI(changed, Number(clip.id)); statusObserver.property = "playing_status";
+            startObserver = new LiveAPI(changed, Number(clip.id)); startObserver.property = "start_time";
+            binding = false;
+        }
+        if (!scalar(clip, "is_playing")) {
+            if (wasPlaying) { outlet(0, "stop"); }
+            wasPlaying = false; return;
+        }
+        // A launch queued for quantization is not a launch yet.
+        if (scalar(clip, "is_triggered")) { return; }
+        var id = Number(clip.id), started = scalar(clip, "start_time");
+        if (!wasPlaying || id !== lastId || started !== lastStart) {
+            lastId = id; lastStart = started; wasPlaying = true;
+            var name = clip.get("name");
+            if (name instanceof Array) { name = name.join(" "); }
+            outlet(0, "clipname", String(name));
+        }
+    } catch (e) {
+        binding = false; outlet(0, "stop"); release(); diagnostic("Session observer: " + e.message + " — reload device");
+    }
+}
+function notifydeleted() { release(); reconcileTask.freepeer(); }
